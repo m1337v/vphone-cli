@@ -34,6 +34,9 @@ CFW_INPUT="cfw_input"
 CFW_JB_INPUT="cfw_jb_input"
 CFW_JB_ARCHIVE="cfw_jb_input.tar.zst"
 TEMP_DIR="$VM_DIR/.cfw_temp"
+JB_FLAVOR="${JB_FLAVOR:-regular}"  # regular | roothide
+JB_BOOTSTRAP_ZST="${JB_BOOTSTRAP_ZST:-}"
+JB_SILEO_DEB="${JB_SILEO_DEB:-}"
 
 SSH_PORT=2222
 SSH_PASS="alpine"
@@ -50,6 +53,14 @@ SSH_OPTS=(
 
 # ── Helpers ─────────────────────────────────────────────────────
 die() { echo "[-] $*" >&2; exit 1; }
+
+pick_first_existing_file() {
+    local candidate
+    for candidate in "$@"; do
+        [[ -n "$candidate" && -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    return 1
+}
 
 is_exec_compatible() {
     local bin="$1"
@@ -135,6 +146,69 @@ get_boot_manifest_hash() {
     ssh_cmd "/bin/ls /mnt5 2>/dev/null" | awk 'length($0)==96{print; exit}'
 }
 
+# Normalize extracted bootstrap into:
+# /mnt5/<boot-hash>/jb-vphone/procursus/{usr,etc,var,...}
+#
+# Supported archive layouts:
+#  1) var/jb/...                      (legacy/regular)
+#  2) jb/...                          (prefixed)
+#  3) usr/... + var/... at archive root (roothide strapfiles)
+normalize_bootstrap_layout() {
+    local jb_root="$1"
+    local proc_dir="$jb_root/procursus"
+    local src="$jb_root"
+
+    ssh_cmd "/bin/mkdir -p '$proc_dir'"
+
+    if ssh_cmd "test -d '$jb_root/var/jb'" 2>/dev/null; then
+        src="$jb_root/var/jb"
+    elif ssh_cmd "test -d '$jb_root/jb'" 2>/dev/null; then
+        src="$jb_root/jb"
+    fi
+
+    ssh_cmd "/usr/bin/find '$src' -mindepth 1 -maxdepth 1 ! -name procursus -exec /bin/mv {} '$proc_dir' \\;"
+
+    # Clean up legacy staging paths if they exist
+    ssh_cmd "/bin/rm -rf '$jb_root/var/jb' '$jb_root/jb'"
+}
+
+resolve_bootstrap_inputs() {
+    case "$JB_FLAVOR" in
+        regular|roothide) ;;
+        *) die "Unsupported JB_FLAVOR '$JB_FLAVOR' (expected: regular or roothide)" ;;
+    esac
+
+    if [[ -z "$JB_BOOTSTRAP_ZST" ]]; then
+        if [[ "$JB_FLAVOR" == "roothide" ]]; then
+            JB_BOOTSTRAP_ZST="$(pick_first_existing_file \
+                "$JB_INPUT_DIR/jb/bootstrap-roothide-iphoneos-arm64.tar.zst" \
+                "$JB_INPUT_DIR/jb/bootstrap-1900.tar.zst" \
+                "$JB_INPUT_DIR/jb/bootstrap-1800.tar.zst" \
+                "$JB_INPUT_DIR/jb/bootstrap-nathanlr-iphoneos-arm64.tar.zst" \
+            || true)"
+        else
+            JB_BOOTSTRAP_ZST="$JB_INPUT_DIR/jb/bootstrap-iphoneos-arm64.tar.zst"
+        fi
+    fi
+    [[ -f "$JB_BOOTSTRAP_ZST" ]] || die "Missing bootstrap archive: $JB_BOOTSTRAP_ZST"
+
+    if [[ -z "$JB_SILEO_DEB" ]]; then
+        if [[ "$JB_FLAVOR" == "roothide" ]]; then
+            JB_SILEO_DEB="$(pick_first_existing_file \
+                "$JB_INPUT_DIR/jb/sileo.deb" \
+                "$JB_INPUT_DIR/jb/org.coolstar.sileo_2.5.1-12_iphoneos-arm64e.deb" \
+                "$JB_INPUT_DIR/jb/org.coolstar.sileo_2.5.1_iphoneos-arm64.deb" \
+            || true)"
+        else
+            JB_SILEO_DEB="$JB_INPUT_DIR/jb/org.coolstar.sileo_2.5.1_iphoneos-arm64.deb"
+        fi
+    fi
+
+    if [[ -n "$JB_SILEO_DEB" && ! -f "$JB_SILEO_DEB" ]]; then
+        die "Configured JB_SILEO_DEB does not exist: $JB_SILEO_DEB"
+    fi
+}
+
 # ── Setup JB input resources ──────────────────────────────────
 setup_cfw_jb_input() {
     [[ -d "$VM_DIR/$CFW_JB_INPUT" ]] && return
@@ -157,6 +231,14 @@ setup_cfw_jb_input
 JB_INPUT_DIR="$VM_DIR/$CFW_JB_INPUT"
 echo ""
 echo "[+] JB input resources: $JB_INPUT_DIR"
+resolve_bootstrap_inputs
+echo "[+] JB flavor: $JB_FLAVOR"
+echo "[+] Bootstrap archive: $JB_BOOTSTRAP_ZST"
+if [[ -n "$JB_SILEO_DEB" ]]; then
+    echo "[+] Sileo package: $JB_SILEO_DEB"
+else
+    echo "[!] Sileo package not configured; bootstrap will proceed without staging a Sileo .deb"
+fi
 resolve_sshpass
 
 mkdir -p "$TEMP_DIR"
@@ -197,28 +279,22 @@ BOOT_HASH="$(get_boot_manifest_hash)"
 [[ -n "$BOOT_HASH" ]] || die "Could not find 96-char boot manifest hash in /mnt5"
 echo "  Boot manifest hash: $BOOT_HASH"
 
-BOOTSTRAP_ZST="$JB_INPUT_DIR/jb/bootstrap-iphoneos-arm64.tar.zst"
-SILEO_DEB="$JB_INPUT_DIR/jb/org.coolstar.sileo_2.5.1_iphoneos-arm64.deb"
-[[ -f "$BOOTSTRAP_ZST" ]] || die "Missing $BOOTSTRAP_ZST"
+BOOTSTRAP_TAR_BASENAME="$(basename "${JB_BOOTSTRAP_ZST%.zst}")"
+BOOTSTRAP_TAR="$TEMP_DIR/$BOOTSTRAP_TAR_BASENAME"
+zstd -d -f "$JB_BOOTSTRAP_ZST" -o "$BOOTSTRAP_TAR"
 
-BOOTSTRAP_TAR="$TEMP_DIR/bootstrap-iphoneos-arm64.tar"
-zstd -d -f "$BOOTSTRAP_ZST" -o "$BOOTSTRAP_TAR"
-
-scp_to "$BOOTSTRAP_TAR" "/mnt5/$BOOT_HASH/bootstrap-iphoneos-arm64.tar"
-if [[ -f "$SILEO_DEB" ]]; then
-    scp_to "$SILEO_DEB" "/mnt5/$BOOT_HASH/org.coolstar.sileo_2.5.1_iphoneos-arm64.deb"
+scp_to "$BOOTSTRAP_TAR" "/mnt5/$BOOT_HASH/$BOOTSTRAP_TAR_BASENAME"
+if [[ -n "$JB_SILEO_DEB" ]]; then
+    scp_to "$JB_SILEO_DEB" "/mnt5/$BOOT_HASH/$(basename "$JB_SILEO_DEB")"
 fi
 
 ssh_cmd "/bin/mkdir -p /mnt5/$BOOT_HASH/jb-vphone"
 ssh_cmd "/bin/chmod 0755 /mnt5/$BOOT_HASH/jb-vphone"
 ssh_cmd "/usr/sbin/chown 0:0 /mnt5/$BOOT_HASH/jb-vphone"
-ssh_cmd "/usr/bin/tar --preserve-permissions -xkf /mnt5/$BOOT_HASH/bootstrap-iphoneos-arm64.tar \
+ssh_cmd "/usr/bin/tar --preserve-permissions -xkf /mnt5/$BOOT_HASH/$BOOTSTRAP_TAR_BASENAME \
     -C /mnt5/$BOOT_HASH/jb-vphone/"
-ssh_cmd "/bin/mv /mnt5/$BOOT_HASH/jb-vphone/var /mnt5/$BOOT_HASH/jb-vphone/procursus"
-ssh_cmd "/bin/mkdir -p /mnt5/$BOOT_HASH/jb-vphone/procursus"
-ssh_cmd "/bin/mv /mnt5/$BOOT_HASH/jb-vphone/procursus/jb/* /mnt5/$BOOT_HASH/jb-vphone/procursus 2>/dev/null || true"
-ssh_cmd "/bin/rm -rf /mnt5/$BOOT_HASH/jb-vphone/procursus/jb"
-ssh_cmd "/bin/rm -f /mnt5/$BOOT_HASH/bootstrap-iphoneos-arm64.tar"
+normalize_bootstrap_layout "/mnt5/$BOOT_HASH/jb-vphone"
+ssh_cmd "/bin/rm -f /mnt5/$BOOT_HASH/$BOOTSTRAP_TAR_BASENAME"
 rm -f "$BOOTSTRAP_TAR"
 
 echo "  [+] procursus bootstrap installed"
@@ -254,7 +330,7 @@ ssh_cmd "/sbin/umount /mnt5 2>/dev/null || true"
 
 echo "[*] Cleaning up temp binaries..."
 rm -f "$TEMP_DIR/launchd" \
-      "$TEMP_DIR/bootstrap-iphoneos-arm64.tar"
+      "${BOOTSTRAP_TAR:-$TEMP_DIR/bootstrap-iphoneos-arm64.tar}"
 
 echo ""
 echo "[+] CFW + JB installation complete!"
