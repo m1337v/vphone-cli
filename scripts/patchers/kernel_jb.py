@@ -60,45 +60,59 @@ class KernelJBPatcher(
 ):
     _TIMING_LOG_MIN_SECONDS = 10.0
 
+    # Problematic Patches
+    # | JB-14 | patch_bsd_init_auth           | _bsd_init (2nd auth gate)          | Skip auth at @%s:%d                                    |
+    # | JB-15 | patch_dounmount               | _dounmount                         | Allow unmount (strict in-function match)               |
+    # | JB-16 | patch_io_secure_bsd_root      | _IOSecureBSDRoot                   | Skip secure root check (guard-site filter)             |
+    # | JB-17 | patch_load_dylinker           | _load_dylinker                     | Skip strict `LC_LOAD_DYLINKER == "/usr/lib/dyld"` gate |
+    # | JB-18 | patch_mac_mount               | ___mac_mount                       | Bypass MAC mount deny path (strict site)               |
+    # | JB-19 | patch_nvram_verify_permission | _verifyPermission (NVRAM)          | Allow NVRAM writes                                     |
+    # | JB-20 | patch_shared_region_map       | _shared_region_map_and_slide_setup | Force shared region path                               |
+    # | JB-21 | patch_spawn_validate_persona  | _spawn_validate_persona            | Skip persona validation                                |
+    # | JB-22 | patch_task_for_pid            | _task_for_pid                      | Allow task_for_pid                                     |
+    # | JB-23 | patch_thid_should_crash       | _thid_should_crash                 | Prevent GUARD_TYPE_MACH_PORT crash                     |
+    # | JB-24 | patch_vm_fault_enter_prepare  | _vm_fault_enter_prepare            | Skip fault check                                       |
+    # | JB-25 | patch_vm_map_protect          | _vm_map_protect                    | Allow VM protect                                       |
+
     # Group A: Core gate-bypass methods.
     _GROUP_A_METHODS = (
-        "patch_amfi_cdhash_in_trustcache",      # JB-01 / A1
-        "patch_amfi_execve_kill_path",          # JB-02 / A2
+        "patch_amfi_cdhash_in_trustcache",  # JB-01 / A1
+        "patch_amfi_execve_kill_path",  # JB-02 / A2
         "patch_task_conversion_eval_internal",  # JB-08 / A3
-        "patch_sandbox_hooks_extended",         # JB-09 / A4
-        "patch_iouc_failed_macf",              # JB-10 / A5
-    )
-
-    # Group C: Shellcode/trampoline heavy methods.
-    _GROUP_C_METHODS = (
-        "patch_cred_label_update_execve",       # JB-03 / C21 (low-riskized)
-        "patch_hook_cred_label_update_execve",  # JB-04 / C23 (low-riskized)
-        "patch_kcall10",                        # JB-05 / C24 (low-riskized)
-        "patch_syscallmask_apply_to_proc",      # JB-07 / C22
+        "patch_sandbox_hooks_extended",  # JB-09 / A4
+        "patch_iouc_failed_macf",  # JB-10 / A5
     )
 
     # Group B: Pattern/string anchored methods.
     _GROUP_B_METHODS = (
-        "patch_post_validation_additional",     # JB-06 / B5
-        "patch_proc_security_policy",           # JB-11 / B6
-        "patch_proc_pidinfo",                   # JB-12 / B7
-        "patch_convert_port_to_map",            # JB-13 / B8
-        "patch_bsd_init_auth",                  # JB-14 / B13
-        "patch_dounmount",                      # JB-15 / B12
-        "patch_io_secure_bsd_root",             # JB-16 / B19
-        "patch_load_dylinker",                  # JB-17 / B16
-        "patch_mac_mount",                      # JB-18 / B11
-        "patch_nvram_verify_permission",        # JB-19 / B18
-        "patch_shared_region_map",              # JB-20 / B17
-        "patch_spawn_validate_persona",         # JB-21 / B14
-        "patch_task_for_pid",                   # JB-22 / B15
-        "patch_thid_should_crash",              # JB-23 / B20
-        "patch_vm_fault_enter_prepare",         # JB-24 / B9
-        "patch_vm_map_protect",                 # JB-25 / B10
+        "patch_post_validation_additional",  # JB-06 / B5
+        "patch_proc_security_policy",  # JB-11 / B6
+        "patch_proc_pidinfo",  # JB-12 / B7
+        "patch_convert_port_to_map",  # JB-13 / B8
+        "patch_bsd_init_auth",  # JB-14 / B13
+        "patch_dounmount",  # JB-15 / B12
+        "patch_io_secure_bsd_root",  # JB-16 / B19
+        "patch_load_dylinker",  # JB-17 / B16
+        "patch_mac_mount",  # JB-18 / B11
+        "patch_nvram_verify_permission",  # JB-19 / B18
+        "patch_shared_region_map",  # JB-20 / B17
+        "patch_spawn_validate_persona",  # JB-21 / B14
+        "patch_task_for_pid",  # JB-22 / B15
+        "patch_thid_should_crash",  # JB-23 / B20
+        "patch_vm_fault_enter_prepare",  # JB-24 / B9
+        "patch_vm_map_protect",  # JB-25 / B10
+    )
+
+    # Group C: Shellcode/trampoline heavy methods.
+    _GROUP_C_METHODS = (
+        "patch_cred_label_update_execve",  # JB-03 / C21 (low-riskized)
+        "patch_hook_cred_label_update_execve",  # JB-04 / C23 (low-riskized)
+        "patch_kcall10",  # JB-05 / C24 (low-riskized)
+        "patch_syscallmask_apply_to_proc",  # JB-07 / C22
     )
 
     # Full JB patch schedule (all validated patch methods enabled by default).
-    _PATCH_METHODS = _GROUP_A_METHODS + _GROUP_C_METHODS + _GROUP_B_METHODS
+    _PATCH_METHODS = _GROUP_A_METHODS + _GROUP_B_METHODS + _GROUP_C_METHODS
 
     def __init__(self, data, verbose=False):
         super().__init__(data, verbose)
@@ -136,7 +150,9 @@ class KernelJBPatcher(
             return
         slow_items = [
             item
-            for item in sorted(self.patch_timings, key=lambda item: item[1], reverse=True)
+            for item in sorted(
+                self.patch_timings, key=lambda item: item[1], reverse=True
+            )
             if item[1] >= self._TIMING_LOG_MIN_SECONDS
         ]
         if not slow_items:
@@ -154,10 +170,7 @@ class KernelJBPatcher(
         self.patch_timings = []
 
         plan = self._build_method_plan()
-        self._log(
-            "[*] JB method plan: "
-            + (", ".join(plan) if plan else "(empty)")
-        )
+        self._log("[*] JB method plan: " + (", ".join(plan) if plan else "(empty)"))
         self._run_methods(plan)
         self._print_timing_summary()
 
